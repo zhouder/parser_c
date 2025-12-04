@@ -22,6 +22,9 @@ def is_union_kw(tok) -> bool:
 def is_dl(tok, ch: str) -> bool:
     return tok.type == TokenType.DL and tok.lexeme == ch
 
+def is_dl_or_op(tok, ch: str) -> bool:
+    return (tok.type == TokenType.DL or tok.type == TokenType.OP) and tok.lexeme == ch
+
 def is_op(tok, op: str) -> bool:
     return tok.type == TokenType.OP and tok.lexeme == op
 
@@ -119,14 +122,17 @@ class Parser:
             self.advance()
         else:
             self.error("缺少 include")
-        if is_dl(self.lookahead, "<"):
+        if is_dl_or_op(self.lookahead, "<"):
             self.advance()
             header = []
             # 聚合直到 >
-            while not is_dl(self.lookahead, ">") and self.lookahead.type != TokenType.EOF:
+            while not is_dl_or_op(self.lookahead, ">") and self.lookahead.type != TokenType.EOF:
                 header.append(self.lookahead.lexeme)
                 self.advance()
-            self.match_dl(">")
+            if is_dl_or_op(self.lookahead, ">"):
+                self.advance()
+            else:
+                self.error("缺少 >")
             return ast.Preprocess(header="".join(header))
         else:
             self.error("缺少 <header>")
