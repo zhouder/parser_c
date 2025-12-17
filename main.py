@@ -1,6 +1,7 @@
 import argparse
 import sys
 from pathlib import Path
+from typing import List
 
 # 语法与工具
 from service.grammer import build_grammar, EPSILON, END_SYMBOL
@@ -11,20 +12,120 @@ from service.first_follow import (
     first_of_sequence,
 )
 from service.parse_table import ParseTable
-from service.parser import Parser, ParseError
+from service.ast_builder import ASTNode, build_ast
+from service.parser import Parser, ParseError, ParseTreeNode
+
+
+def _tree_label(node: ParseTreeNode) -> str:
+    if node.lexeme is None or node.lexeme == "" or node.lexeme == node.symbol:
+        return node.symbol
+    return f"{node.symbol}: {node.lexeme}"
+
+
+def render_tree_lines(node: ParseTreeNode, prefix: str = "", is_last: bool = True) -> List[str]:
+    connector = "`- " if is_last else "|- "
+    head = _tree_label(node) if prefix == "" else f"{connector}{_tree_label(node)}"
+    lines = [f"{prefix}{head}"]
+    child_prefix = prefix + ("   " if is_last else "|  ")
+    for idx, child in enumerate(node.children):
+        lines.extend(render_tree_lines(child, prefix=child_prefix, is_last=(idx == len(node.children) - 1)))
+    return lines
+
+
+def render_ast_lines(node: ASTNode, prefix: str = "", is_last: bool = True) -> List[str]:
+    connector = "`- " if is_last else "|- "
+    label = node.kind if node.value is None else f"{node.kind}: {node.value}"
+    head = label if prefix == "" else f"{connector}{label}"
+    lines = [f"{prefix}{head}"]
+    child_prefix = prefix + ("   " if is_last else "|  ")
+    for idx, child in enumerate(node.children):
+        lines.extend(render_ast_lines(child, prefix=child_prefix, is_last=(idx == len(node.children) - 1)))
+    return lines
+
+
+def render_ll1_table_lines(table: ParseTable, grammar, nonterminal: str | None, limit: int) -> List[str]:
+    nts = [nonterminal] if nonterminal else sorted(grammar.nonterminals)
+    lines: List[str] = []
+    total = 0
+    printed = 0
+
+    for nt in nts:
+        row = table.table.get(nt, {})
+        total += len(row)
+
+    for nt in nts:
+        row = table.table.get(nt, {})
+        if not row:
+            continue
+        for term in sorted(row.keys()):
+            prod = row[term]
+            rhs = " ".join(sym if sym != EPSILON else "epsilon" for sym in prod.body)
+            lines.append(f"M[{nt}, {term}] = {prod.head} -> {rhs}")
+            printed += 1
+            if limit != 0 and printed >= limit:
+                remaining = total - printed
+                if remaining > 0:
+                    lines.append(f"... omitted {remaining} table entries (increase --table-limit or set 0 for all)")
+                return lines
+
+    return lines
+
+
+def _used_nonterminals_from_productions(grammar, prods) -> List[str]:
+    used = set()
+    for p in prods:
+        used.add(p.head)
+        for s in p.body:
+            if grammar.is_nonterminal(s):
+                used.add(s)
+    return sorted(used)
 
 
 def main():
     ap = argparse.ArgumentParser(description="LL(1) parser for a C-subset (parser_c)")
     ap.add_argument("source", nargs="?", default=None, help="C source file to parse")
     ap.add_argument("--show-ff", action="store_true", help="Show FIRST/FOLLOW/SELECT and table size")
+    ap.add_argument(
+        "--show-ff-used",
+        action="store_true",
+        help="Show FIRST/FOLLOW/SELECT only for nonterminals/productions used while parsing the source file.",
+    )
+    ap.add_argument("--show-select-all", action="store_true", help="Show SELECT sets for all productions (can be long)")
+    ap.add_argument("--show-table", action="store_true", help="Print LL(1) parse table (can be very long)")
+    ap.add_argument(
+        "--show-table-used",
+        action="store_true",
+        help="Print only the LL(1) table entries actually used while parsing the source file.",
+    )
+    ap.add_argument("--table-nt", default=None, help="Only print one nonterminal row for --show-table (e.g. Expr)")
+    ap.add_argument(
+        "--table-limit",
+        type=int,
+        default=200,
+        help="How many table entries to print (0 = all, default: 200). Requires --show-table.",
+    )
     ap.add_argument("--trace", action="store_true", help="Trace parsing steps")
+    ap.add_argument(
+        "--trace-limit",
+        type=int,
+        default=200,
+        help="How many trace lines to print (0 = all, default: 200). Requires --trace.",
+    )
+    ap.add_argument("--show-tree", action="store_true", help="Print parse tree (syntax tree)")
+    ap.add_argument("--show-ast", action="store_true", help="Print a simplified AST (abstract syntax tree)")
     ap.add_argument(
         "--export-xlsx",
         nargs="?",
         const="parse_table.xlsx",
         default=None,
         help="Export LL(1) parse table to an .xlsx file (default: parse_table.xlsx)",
+    )
+    ap.add_argument(
+        "--export-xlsx-used",
+        nargs="?",
+        const="parse_table_used.xlsx",
+        default=None,
+        help="Export only the LL(1) table entries used while parsing the source file (default: parse_table_used.xlsx)",
     )
     args = ap.parse_args()
 
@@ -37,7 +138,8 @@ def main():
         print(f"[Error] Source file not found: {src_path}")
         sys.exit(1)
 
-    text = src_path.read_text(encoding="utf-8", errors="ignore")
+    # utf-8-sig 会自动去掉 BOM（\ufeff）
+    text = src_path.read_text(encoding="utf-8-sig", errors="ignore")
 
     # 1) 文法
     grammar = build_grammar()
@@ -64,24 +166,99 @@ def main():
         for nt in sorted(grammar.nonterminals):
             items = ", ".join(sorted(follow_sets[nt], key=lambda s: (s != END_SYMBOL, s)))
             print(f"FOLLOW({nt}) = {{ {items} }}")
-        print("\n=== SELECT (sample) ===")
-        cnt = 0
-        for prod, sel in select_sets.items():
-            print(f"SELECT({prod}) = {{ {', '.join(sorted(sel))} }}")
-            cnt += 1
-            if cnt >= 12:
-                print("... (more omitted)")
-                break
+        print("\n=== SELECT Sets ===")
+        if args.show_select_all:
+            for prod, sel in select_sets.items():
+                print(f"SELECT({prod}) = {{ {', '.join(sorted(sel))} }}")
+        else:
+            cnt = 0
+            for prod, sel in select_sets.items():
+                print(f"SELECT({prod}) = {{ {', '.join(sorted(sel))} }}")
+                cnt += 1
+                if cnt >= 12:
+                    print("... (more omitted; use --show-select-all for full list)")
+                    break
 
         total_cells = sum(len(row) for row in table.table.values())
         print(f"\n[Table] Nonterminals: {len(grammar.nonterminals)} | Terminals: {len(grammar.terminals)}")
         print(f"[Table] Filled cells: {total_cells}\n")
 
+    if args.show_table:
+        print("=== LL(1) Parse Table ===")
+        lines = render_ll1_table_lines(table, grammar, nonterminal=args.table_nt, limit=args.table_limit)
+        print("\n".join(lines))
+        print("")
+
     # 4) 解析
     parser = Parser(grammar=grammar, table=table, debug=args.trace)
     try:
-        parser.parse_source(text)
+        need_tree = args.show_tree or args.show_ast
+        tree = parser.parse_source(text, return_tree=need_tree)
         print("[OK] 语法分析通过")
+
+        if args.export_xlsx_used:
+            out_path = Path(args.export_xlsx_used)
+            # Build a reduced table from the cells actually used during parsing.
+            used_tbl = {}
+            used_terms = set()
+            used_nts = set()
+            for nt, term, prod in parser.used_table_entries:
+                used_nts.add(nt)
+                used_terms.add(term)
+                used_tbl.setdefault(nt, {})[term] = prod
+            used_table = ParseTable(used_tbl)
+            used_table.export_xlsx(
+                out_path,
+                grammar,
+                terminal_order=sorted(used_terms),
+                nonterminal_order=sorted(used_nts),
+            )
+            print(f"[Export] Used LL(1) table entries saved to: {out_path}")
+        if args.show_table_used:
+            print("\n=== LL(1) Parse Table (used entries) ===")
+            seen_cells = set()
+            printed = 0
+            for nt, term, prod in parser.used_table_entries:
+                key = (nt, term)
+                if key in seen_cells:
+                    continue
+                seen_cells.add(key)
+                rhs = " ".join(sym if sym != EPSILON else "epsilon" for sym in prod.body)
+                print(f"M[{nt}, {term}] = {prod.head} -> {rhs}")
+                printed += 1
+                if args.table_limit != 0 and printed >= args.table_limit:
+                    print("... omitted remaining used entries (increase --table-limit or set 0 for all)")
+                    break
+        if args.show_ff_used:
+            used_nts = _used_nonterminals_from_productions(grammar, parser.used_productions)
+            print("\n=== FIRST Sets (used) ===")
+            for nt in used_nts:
+                items = ", ".join(sorted(first_sets[nt], key=lambda s: (s != EPSILON, s)))
+                print(f"FIRST({nt}) = {{ {items} }}")
+            print("\n=== FOLLOW Sets (used) ===")
+            for nt in used_nts:
+                items = ", ".join(sorted(follow_sets[nt], key=lambda s: (s != END_SYMBOL, s)))
+                print(f"FOLLOW({nt}) = {{ {items} }}")
+            print("\n=== SELECT Sets (used productions) ===")
+            seen = set()
+            for prod in parser.used_productions:
+                if prod in seen:
+                    continue
+                seen.add(prod)
+                sel = select_sets.get(prod, set())
+                print(f"SELECT({prod}) = {{ {', '.join(sorted(sel))} }}")
+        if args.trace:
+            print("\n=== Trace ===")
+            lines = parser.trace if args.trace_limit == 0 else parser.trace[-args.trace_limit :]
+            for line in lines:
+                print(line)
+        if args.show_tree and tree is not None:
+            print("\n=== Parse Tree ===")
+            print("\n".join(render_tree_lines(tree)))
+        if args.show_ast and tree is not None:
+            print("\n=== AST ===")
+            ast = build_ast(tree)
+            print("\n".join(render_ast_lines(ast)))
     except ParseError as e:
         loc = f"{e.line}:{e.col}" if e.line is not None else "?"
         print(f"[SyntaxError] 在 {loc} 处：{e.message}")

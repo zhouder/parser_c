@@ -1,14 +1,18 @@
 #include <stdio.h>
 
-union Data{
-    int intValue;
-    char charValue[2];
-} dummy;
+struct student{
+    char* name;   // 姓名
+    int num;      // 学号
+    int age;      // 年龄
+    float score;  // 成绩
+};
+
 void main(){
-    union Data data;
-    data.intValue=0x1234;//十六进制数
-    data.charValue[0]=0101;//八进制
-    data.charValue[1]=97;
-    if(data.intValue%2==0)printf("%c",data.charValue[0]);
-    else printf("%c",data.charValue[1]);
+    int i, num_140 = 0;
+    float sum = 0;
+    student sts[2] = {{"li ping", 5, 18, 145.0},
+                      {"wang ming", 6, 18, 150.0}};
+    if(sts[1].score < 140) flag = -1;
+    else flag = 1;
+    printf("%d", flag);
 }

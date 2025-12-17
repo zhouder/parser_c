@@ -1,12 +1,13 @@
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from __future__ import annotations
 
-from .grammer import Grammar, EPSILON, END_SYMBOL
+from dataclasses import dataclass, field
+from typing import List, Optional, Set, Tuple
+
+from .grammer import END_SYMBOL, EPSILON, Grammar, Production
 from .parse_table import ParseTable
 
-# 复用你的 lexer_c
 from .lexer import Lexer  # type: ignore
-from .token import TokenType  # type: ignore
+from .token import Token, TokenType  # type: ignore
 
 
 @dataclass
@@ -16,18 +17,33 @@ class ParseError(Exception):
     col: Optional[int] = None
 
 
+@dataclass
+class ParseTreeNode:
+    symbol: str
+    lexeme: Optional[str] = None  # only for terminals
+    line: Optional[int] = None
+    col: Optional[int] = None
+    children: List["ParseTreeNode"] = field(default_factory=list)
+
+    def add_child(self, node: "ParseTreeNode") -> None:
+        self.children.append(node)
+
+
 class Parser:
     def __init__(self, grammar: Grammar, table: ParseTable, debug: bool = False):
         self.grammar = grammar
         self.table = table
         self.debug = debug
         self.trace: List[str] = []
+        self.used_productions: List[Production] = []
+        self.used_table_entries: List[Tuple[str, str, Production]] = []
+        # 收集 struct/union 的标签名，使其可以当作 TYPE_NAME 使用（用于兼容 `student a;` 这种写法）
+        self.type_names: Set[str] = set()
 
-    # —— 将词法记号映射为文法终结符 —— #
-    def token_to_symbol(self, tok) -> str:
+    def token_to_symbol(self, tok: Token) -> str:
         """
-        将 lexer_c 的 Token 映射为语法符号名：
-          - ID -> "ID"
+        将 lexer 的 Token 映射为文法终结符名称：
+          - ID -> "ID"（若 lexeme 在 self.type_names 中则映射为 "TYPE_NAME"）
           - NUM10/NUM8/NUM16/INT... -> "INT_CONST"
           - FLOAT -> "FLOAT_CONST"
           - CS_CHAR -> "CHAR_CONST"
@@ -35,123 +51,156 @@ class Parser:
           - RW/OP/DL -> 直接使用 lexeme 作为终结符（如 "if", "+", "(", ";"）
           - EOF -> END_SYMBOL
         """
-        # 兼容不同命名：通过枚举名判断
         tname = getattr(tok.type, "name", str(tok.type))
 
-        # 错误 / EOF
         if "ERROR" in tname:
-            raise ParseError(f"词法错误：{tok.lexeme}", tok.line, tok.col)
+            # 用 repr 避免控制台编码问题（例如遇到 BOM \ufeff）
+            raise ParseError(f"词法错误：{tok.lexeme!r}", tok.line, tok.col)
         if "EOF" in tname:
             return END_SYMBOL
 
-        # 标识符
         if tname == "ID":
+            if tok.lexeme in self.type_names:
+                return "TYPE_NAME"
             return "ID"
 
-        # 整数常量
         if any(key in tname for key in ("NUM10", "NUM8", "NUM16", "INT", "INTEGER")):
             return "INT_CONST"
-
-        # 浮点
         if "FLOAT" in tname:
             return "FLOAT_CONST"
 
-        # 字符/字符串
         if "CS_CHAR" in tname or "CHAR_CONST" in tname:
             return "CHAR_CONST"
         if "CS_STR" in tname or "STRING" in tname:
             return "STRING_CONST"
 
-        # 关键字 / 运算符 / 界符
         if tname in ("RW", "KEYWORD", "OP", "OPERATOR", "DL", "DELIM", "DELIMITER"):
-            # 直接返回词面值，如 if / + / ( / , / #
             return tok.lexeme
 
-        # 兜底：也直接用词面值
         return tok.lexeme
 
-    def parse_source(self, source_text: str) -> None:
+    def parse_source(self, source_text: str, return_tree: bool = False) -> Optional[ParseTreeNode]:
         lexer = Lexer(source_text)
         tokens = lexer.tokenize()
-        # 追加 EOF（若你的 lexer 已自带 EOF，也无妨，映射时会变成 END_SYMBOL）
-        from .token import Token  # type: ignore
 
         if not tokens or getattr(tokens[-1].type, "name", "") != "EOF":
-            # 构造一个 EOF token（尽量不依赖内部结构）
             eof_type = getattr(TokenType, "EOF", None)
             if eof_type is None:
-                # 简单 fallback：创建一个最小对象
                 class _EOF:
                     name = "EOF"
 
                 eof_type = _EOF()
-            tokens.append(Token(eof_type, "", getattr(tokens[-1], "line", 0), getattr(tokens[-1], "col", 0)))  # type: ignore
+            last = tokens[-1] if tokens else Token(TokenType.EOF, "", 1, 1)
+            tokens.append(Token(eof_type, "", getattr(last, "line", 0), getattr(last, "col", 0)))  # type: ignore
 
-        self.parse_tokens(tokens)
+        return self.parse_tokens(tokens, return_tree=return_tree)
 
-    def parse_tokens(self, tokens) -> None:
-        # 映射到文法符号串
-        symbols: List[str] = []
-        positions: List[Tuple[int, int]] = []  # (line, col)
-        for tk in tokens:
-            sym = self.token_to_symbol(tk)
-            symbols.append(sym)
-            positions.append((getattr(tk, "line", None), getattr(tk, "col", None)))
+    def _lookahead_symbol(self, tokens: List[Token], i: int) -> str:
+        if i >= len(tokens):
+            return END_SYMBOL
+        return self.token_to_symbol(tokens[i])
 
-        # 初始化分析栈
+    def parse_tokens(self, tokens: List[Token], return_tree: bool = False) -> Optional[ParseTreeNode]:
+        # 分析栈
         stack: List[str] = [END_SYMBOL, self.grammar.start_symbol]
+        # 与 stack 同步的“父节点栈”：弹出的符号应挂到哪个节点上（仅当 return_tree=True 时使用）
+        parent_stack: List[Optional[ParseTreeNode]] = [None, None]
+        # 与 stack 同步的“角色栈”：用于记录某些 ID 的特殊含义（例如 struct/union 标签名）
+        role_stack: List[Optional[str]] = [None, None]
+
+        root: Optional[ParseTreeNode] = None
         i = 0
 
-        # 调试：栈 + 剩余输入
-        def log(action: str):
+        def preview_input(maxn: int = 12) -> str:
+            out: List[str] = []
+            for j in range(i, min(i + maxn, len(tokens))):
+                out.append(self._lookahead_symbol(tokens, j))
+            return " ".join(out)
+
+        trace_step = 0
+
+        def log(action: str) -> None:
             if not self.debug:
                 return
+            nonlocal trace_step
+            trace_step += 1
             stk = " ".join(stack[::-1])
-            rest = " ".join(symbols[i : min(i + 12, len(symbols))])
-            self.trace.append(f"{action:<20} | stack: [{stk}] | input: {rest}")
+            self.trace.append(f"{trace_step:05d} {action:<20} | stack: [{stk}] | input: {preview_input()}")
 
         log("INIT")
         while True:
             if not stack:
-                # 栈空而输入未结束
-                line, col = positions[max(0, i - 1)]
-                raise ParseError("分析栈提前耗尽，输入尚未结束", line, col)
+                last_tok = tokens[max(0, i - 1)] if tokens else Token(TokenType.EOF, "", 1, 1)
+                raise ParseError("分析栈提前耗尽，输入尚未结束", getattr(last_tok, "line", None), getattr(last_tok, "col", None))
 
             X = stack.pop()
-            a = symbols[i] if i < len(symbols) else END_SYMBOL
+            parent_node = parent_stack.pop()
+            role = role_stack.pop()
+            a = self._lookahead_symbol(tokens, i)
 
             if X == END_SYMBOL and a == END_SYMBOL:
                 log("ACCEPT")
-                return  # 接受
+                return root if return_tree else None
 
             if self.grammar.is_terminal(X) or X == END_SYMBOL:
-                # 终结符：必须匹配
                 if X == a:
                     log(f"match '{a}'")
+                    tok = tokens[i]
+                    if role == "tag_name" and getattr(tok, "lexeme", ""):
+                        self.type_names.add(tok.lexeme)
+
+                    if return_tree and X != END_SYMBOL:
+                        leaf = ParseTreeNode(X, lexeme=tok.lexeme, line=tok.line, col=tok.col)
+                        if parent_node is None:
+                            root = leaf
+                        else:
+                            parent_node.add_child(leaf)
                     i += 1
                     continue
-                else:
-                    line, col = positions[i]
-                    raise ParseError(f"期望终结符 {X}，但看到 {a}", line, col)
 
-            # 非终结符：查预测分析表
+                tok = tokens[i] if i < len(tokens) else Token(TokenType.EOF, "", 0, 0)
+                raise ParseError(f"期望终结符 {X}，但看到 {a}", getattr(tok, "line", None), getattr(tok, "col", None))
+
             prod = self.table.get(X, a)
             if prod is None:
-                # 给出一点候选提示
                 row = self.table.table.get(X, {})
                 candidates = ", ".join(sorted(row.keys()))
-                line, col = positions[i]
+                tok = tokens[i] if i < len(tokens) else Token(TokenType.EOF, "", 0, 0)
                 raise ParseError(
-                    f"在非终结符 {X} 处，对当前输入 {a} 无可用产生式（期望的是: {candidates}）", line, col
+                    f"在非终结符 {X} 处，对当前输入 {a} 无可用产生式（期望的是: {candidates}）",
+                    getattr(tok, "line", None),
+                    getattr(tok, "col", None),
                 )
+            self.used_productions.append(prod)
+            self.used_table_entries.append((X, a, prod))
 
-            # 应用产生式：X → Y1 Y2 ... Yk
+            # 生成语法树节点（若需要）
+            current_node: Optional[ParseTreeNode] = None
+            if return_tree:
+                current_node = ParseTreeNode(X)
+                if parent_node is None:
+                    root = current_node
+                else:
+                    parent_node.add_child(current_node)
+
             rhs = list(prod.body)
             if len(rhs) == 1 and rhs[0] == EPSILON:
                 log(f"reduce {prod}  (ε)")
-                # ε 产生式：什么也不压
-            else:
-                # 逆序压栈
-                for s in reversed(rhs):
-                    stack.append(s)
-                log(f"reduce {prod}")
+                if return_tree and current_node is not None:
+                    current_node.add_child(ParseTreeNode(EPSILON))
+                continue
+
+            # 为 RHS 的每个符号准备角色信息（仅对少数产生式使用）
+            rhs_roles: List[Optional[str]] = [None] * len(rhs)
+            if prod.head in ("StructSpec", "UnionSpec"):
+                # StructSpec -> struct ID StructBodyOpt
+                # UnionSpec  -> union  ID UnionBodyOpt
+                if len(rhs) >= 2 and rhs[1] == "ID":
+                    rhs_roles[1] = "tag_name"
+
+            # 逆序压栈
+            for sym, sym_role in zip(reversed(rhs), reversed(rhs_roles)):
+                stack.append(sym)
+                parent_stack.append(current_node if return_tree else None)
+                role_stack.append(sym_role)
+            log(f"reduce {prod}")

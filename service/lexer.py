@@ -8,8 +8,9 @@ from .matcher import (
 
 class Lexer:
     def __init__(self, text: str):
-        self.text = text
-        self.n = len(text)
+        # 兼容 UTF-8 BOM（\ufeff）：避免把它当作非法字符
+        self.text = text.lstrip("\ufeff")
+        self.n = len(self.text)
         self.pos = 0
         self.line = 1
         self.col = 1

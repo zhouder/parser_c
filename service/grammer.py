@@ -71,9 +71,15 @@ def build_grammar() -> Grammar:
     G.add("P", ["ExtList", END_SYMBOL])
     G.add("ExtList", ["ExtDef", "ExtList"])
     G.add("ExtList", [])  # ε
-    # 外部定义：预处理 或 TypeSpec ID ExtAfterId
+    # 外部定义：预处理 或 TypeSpec (声明/函数定义) 或 TypeSpec ;
+    # 说明：为了支持 `struct S { ... };` / `union U { ... };` 这种“只有类型定义”的语句，
+    #      这里把 `TypeSpec` 后面的部分单独抽出来。
     G.add("ExtDef", ["Preprocess"])
-    G.add("ExtDef", ["TypeSpec", "ID", "ExtAfterId"])
+    G.add("ExtDef", ["TypeSpec", "ExtAfterTypeSpec"])
+
+    # TypeSpec 后续：允许指针 * 出现在第一个 ID 前；也允许单独的 ";"
+    G.add("ExtAfterTypeSpec", ["PtrOpt", "ID", "ExtAfterId"])
+    G.add("ExtAfterTypeSpec", [";"])
 
     # 预处理：# include < header >
     G.add("Preprocess", ["#", "include", "<", "Header", ">"])
@@ -81,9 +87,12 @@ def build_grammar() -> Grammar:
     G.add("HeaderRest", [".", "ID"])
     G.add("HeaderRest", [])  # ε
 
-    # TypeSpec / Union / 基本类型
+    # TypeSpec / Union / Struct / 基本类型
     G.add("TypeSpec", ["BasicType"])
     G.add("TypeSpec", ["UnionSpec"])
+    G.add("TypeSpec", ["StructSpec"])
+    # 额外：支持将 `struct student { ... };` 的标签名 `student` 作为类型名使用（类似 C++/typedef 的效果）
+    G.add("TypeSpec", ["TYPE_NAME"])
     G.add("BasicType", ["int"])
     G.add("BasicType", ["char"])
     G.add("BasicType", ["float"])
@@ -93,6 +102,11 @@ def build_grammar() -> Grammar:
     G.add("UnionSpec", ["union", "ID", "UnionBodyOpt"])
     G.add("UnionBodyOpt", ["{", "DeclListOpt", "}"])
     G.add("UnionBodyOpt", [])  # ε
+
+    # struct 规格说明（简化）：struct ID { ... } 或 struct ID
+    G.add("StructSpec", ["struct", "ID", "StructBodyOpt"])
+    G.add("StructBodyOpt", ["{", "DeclListOpt", "}"])
+    G.add("StructBodyOpt", [])  # ε
     G.add("DeclListOpt", ["DeclList"])
     G.add("DeclListOpt", [])  # ε
     G.add("DeclList", ["Decl", "DeclList"])
@@ -112,11 +126,26 @@ def build_grammar() -> Grammar:
     G.add("InitDeclList", ["InitDecl", "InitDeclListTail"])
     G.add("InitDeclListTail", [",", "InitDecl", "InitDeclListTail"])
     G.add("InitDeclListTail", [])  # ε
-    G.add("InitDecl", ["ID", "ArraySuffixOpt", "InitOpt"])
+
+    # 指针声明（简化）：允许 * 出现在 ID 前，如 char *p;
+    G.add("PtrOpt", ["*", "PtrOpt"])
+    G.add("PtrOpt", [])  # ε
+
+    G.add("InitDecl", ["PtrOpt", "ID", "ArraySuffixOpt", "InitOpt"])
     G.add("ArraySuffixOpt", ["[", "INT_CONST", "]", "ArraySuffixOpt"])
     G.add("ArraySuffixOpt", [])  # ε
-    G.add("InitOpt", ["=", "Expr"])
+    # 初始化（支持表达式与初始化列表）
+    G.add("InitOpt", ["=", "Initializer"])
     G.add("InitOpt", [])  # ε
+
+    # 初始化列表：{ a, b, {c, d} }
+    G.add("Initializer", ["Expr"])
+    G.add("Initializer", ["{", "InitListOpt", "}"])
+    G.add("InitListOpt", ["InitList"])
+    G.add("InitListOpt", [])  # ε
+    G.add("InitList", ["Initializer", "InitListTail"])
+    G.add("InitListTail", [",", "Initializer", "InitListTail"])
+    G.add("InitListTail", [])  # ε
 
     # 函数定义 / 形参
     G.add("FuncDef", ["TypeSpec", "ID", "(", "ParamListOpt", ")", "CompoundStmt"])
@@ -125,7 +154,7 @@ def build_grammar() -> Grammar:
     G.add("ParamList", ["Param", "ParamListTail"])
     G.add("ParamListTail", [",", "Param", "ParamListTail"])
     G.add("ParamListTail", [])  # ε
-    G.add("Param", ["TypeSpec", "ID", "ArraySuffixOpt"])
+    G.add("Param", ["TypeSpec", "PtrOpt", "ID", "ArraySuffixOpt"])
 
     # 语句
     G.add("Stmt", ["ExprStmt"])
