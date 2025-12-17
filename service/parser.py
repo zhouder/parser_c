@@ -1,491 +1,157 @@
-# service/parser.py
-from __future__ import annotations
-from typing import List, Optional, Callable, Iterable, Set
 from dataclasses import dataclass
-from .lexer import Lexer
-from .token import TokenType   # 假设你的 TokenType 定义如：RW/ID/NUM10/NUM8/NUM16/FLOAT/CS_STR/CS_CHAR/OP/DL/EOF
-from . import ast
+from typing import List, Optional, Tuple
 
-# ========== 小工具：按你的 TokenType 封装一些判断 ==========
-TYPE_KEYWORDS = {"int", "char", "float", "double", "void"}
-KW_UNION = "union"
+from .grammer import Grammar, EPSILON, END_SYMBOL
+from .parse_table import ParseTable
 
-def is_kw(tok, word: str) -> bool:
-    return tok.type == TokenType.RW and tok.lexeme == word
+# 复用你的 lexer_c
+from .lexer import Lexer  # type: ignore
+from .token import TokenType  # type: ignore
 
-def is_type_kw(tok) -> bool:
-    return tok.type == TokenType.RW and tok.lexeme in TYPE_KEYWORDS
 
-def is_union_kw(tok) -> bool:
-    return tok.type == TokenType.RW and tok.lexeme == KW_UNION
-
-def is_dl(tok, ch: str) -> bool:
-    return tok.type == TokenType.DL and tok.lexeme == ch
-
-def is_dl_or_op(tok, ch: str) -> bool:
-    return (tok.type == TokenType.DL or tok.type == TokenType.OP) and tok.lexeme == ch
-
-def is_op(tok, op: str) -> bool:
-    return tok.type == TokenType.OP and tok.lexeme == op
-
-def is_id(tok) -> bool:
-    return tok.type == TokenType.ID
-
-def is_const(tok) -> bool:
-    return tok.type in (TokenType.NUM10, TokenType.NUM8, TokenType.NUM16,
-                        TokenType.FLOAT, TokenType.CS_CHAR, TokenType.CS_STR)
-
-# ========== 语法错误 ==========
 @dataclass
-class ParseError:
-    line: int
-    col: int
-    msg: str
+class ParseError(Exception):
+    message: str
+    line: Optional[int] = None
+    col: Optional[int] = None
 
-# ========== Parser ==========
+
 class Parser:
-    def __init__(self, lexer: Lexer):
-        self.lexer = lexer
-        self.lookahead = self.lexer.next_token()
-        self.errors: List[ParseError] = []
+    def __init__(self, grammar: Grammar, table: ParseTable, debug: bool = False):
+        self.grammar = grammar
+        self.table = table
+        self.debug = debug
+        self.trace: List[str] = []
 
-    # ---- 基本移动/匹配 ----
-    def advance(self):
-        self.lookahead = self.lexer.next_token()
+    # —— 将词法记号映射为文法终结符 —— #
+    def token_to_symbol(self, tok) -> str:
+        """
+        将 lexer_c 的 Token 映射为语法符号名：
+          - ID -> "ID"
+          - NUM10/NUM8/NUM16/INT... -> "INT_CONST"
+          - FLOAT -> "FLOAT_CONST"
+          - CS_CHAR -> "CHAR_CONST"
+          - CS_STR  -> "STRING_CONST"
+          - RW/OP/DL -> 直接使用 lexeme 作为终结符（如 "if", "+", "(", ";"）
+          - EOF -> END_SYMBOL
+        """
+        # 兼容不同命名：通过枚举名判断
+        tname = getattr(tok.type, "name", str(tok.type))
 
-    def error(self, msg: str):
-        self.errors.append(ParseError(getattr(self.lookahead, "line", -1),
-                                      getattr(self.lookahead, "col", -1),
-                                      msg))
+        # 错误 / EOF
+        if "ERROR" in tname:
+            raise ParseError(f"词法错误：{tok.lexeme}", tok.line, tok.col)
+        if "EOF" in tname:
+            return END_SYMBOL
 
-    def match_kw(self, word: str):
-        if is_kw(self.lookahead, word):
-            t = self.lookahead; self.advance(); return t
-        self.error(f"需要关键字 `{word}`，实际是 `{self.lookahead.lexeme}`")
-        return None
+        # 标识符
+        if tname == "ID":
+            return "ID"
 
-    def match_dl(self, ch: str):
-        if is_dl(self.lookahead, ch):
-            t = self.lookahead; self.advance(); return t
-        self.error(f"需要符号 `{ch}`，实际是 `{self.lookahead.lexeme}`")
-        return None
+        # 整数常量
+        if any(key in tname for key in ("NUM10", "NUM8", "NUM16", "INT", "INTEGER")):
+            return "INT_CONST"
 
-    def match_op(self, op: str):
-        if is_op(self.lookahead, op):
-            t = self.lookahead; self.advance(); return t
-        self.error(f"需要运算符 `{op}`，实际是 `{self.lookahead.lexeme}`")
-        return None
+        # 浮点
+        if "FLOAT" in tname:
+            return "FLOAT_CONST"
 
-    def match_id(self, expect: Optional[str]=None):
-        if is_id(self.lookahead) and (expect is None or self.lookahead.lexeme == expect):
-            t = self.lookahead; self.advance(); return t
-        exp = expect or "标识符"
-        self.error(f"需要 {exp}，实际是 `{self.lookahead.lexeme}`")
-        return None
+        # 字符/字符串
+        if "CS_CHAR" in tname or "CHAR_CONST" in tname:
+            return "CHAR_CONST"
+        if "CS_STR" in tname or "STRING" in tname:
+            return "STRING_CONST"
 
-    def match_const(self):
-        if is_const(self.lookahead):
-            t = self.lookahead; self.advance(); return t
-        self.error(f"需要常量，实际是 `{self.lookahead.lexeme}`")
-        return None
+        # 关键字 / 运算符 / 界符
+        if tname in ("RW", "KEYWORD", "OP", "OPERATOR", "DL", "DELIM", "DELIMITER"):
+            # 直接返回词面值，如 if / + / ( / , / #
+            return tok.lexeme
 
-    def synchronize(self, sync: Iterable[str] = (";", "}",)):
-        # 简单错误恢复：丢弃直到遇到 ; 或 }
-        sync_set = set(sync)
-        while self.lookahead.type != TokenType.EOF and not (self.lookahead.type == TokenType.DL and self.lookahead.lexeme in sync_set):
-            self.advance()
-        if self.lookahead.type != TokenType.EOF:
-            self.advance()
+        # 兜底：也直接用词面值
+        return tok.lexeme
 
-    # ========== Program / External ==========
-    def parse_program(self) -> ast.Program:
-        externals: List[ast.Node] = []
-        while self.lookahead.type != TokenType.EOF:
-            # 预处理：# include <...>
-            if is_dl(self.lookahead, "#"):
-                externals.append(self.parse_preprocess())
-                continue
-            # 类型/union 开头
-            if is_type_kw(self.lookahead) or is_union_kw(self.lookahead):
-                ext = self.parse_extdef()
-                if ext: externals.append(ext)
-                continue
-            # 容错：其它开头直接报错并跳过
-            self.error("文件最外层应为预处理指令、类型声明或函数定义")
-            self.synchronize(sync=(";", "}"))
-        return ast.Program(externals)
+    def parse_source(self, source_text: str) -> None:
+        lexer = Lexer(source_text)
+        tokens = lexer.tokenize()
+        # 追加 EOF（若你的 lexer 已自带 EOF，也无妨，映射时会变成 END_SYMBOL）
+        from .token import Token  # type: ignore
 
-    def parse_preprocess(self) -> ast.Preprocess:
-        # '#' 'include' '<' header '>'
-        self.match_dl("#")
-        if self.lookahead.lexeme == "include":  # 可能是 RW 或 ID；这里不强制类型
-            self.advance()
-        else:
-            self.error("缺少 include")
-        if is_dl_or_op(self.lookahead, "<"):
-            self.advance()
-            header = []
-            # 聚合直到 >
-            while not is_dl_or_op(self.lookahead, ">") and self.lookahead.type != TokenType.EOF:
-                header.append(self.lookahead.lexeme)
-                self.advance()
-            if is_dl_or_op(self.lookahead, ">"):
-                self.advance()
-            else:
-                self.error("缺少 >")
-            return ast.Preprocess(header="".join(header))
-        else:
-            self.error("缺少 <header>")
-            return ast.Preprocess(header="")
+        if not tokens or getattr(tokens[-1].type, "name", "") != "EOF":
+            # 构造一个 EOF token（尽量不依赖内部结构）
+            eof_type = getattr(TokenType, "EOF", None)
+            if eof_type is None:
+                # 简单 fallback：创建一个最小对象
+                class _EOF:
+                    name = "EOF"
 
-    def parse_extdef(self) -> Optional[ast.Node]:
-        tps = self.parse_type_spec()
-        ident = self.match_id()
-        if ident is None: 
-            self.synchronize(); 
-            return None
-        # 看看是否函数定义
-        if is_dl(self.lookahead, "("):
-            # 函数定义
-            self.match_dl("(")
-            params = self.parse_param_list_opt()
-            self.match_dl(")")
-            body = self.parse_compound_stmt()
-            return ast.FuncDef(ret_type=tps, name=ident.lexeme, params=params, body=body)
-        # 否则是变量声明列表（从第一个声明器已经读了 ID）
-        items = [self.parse_init_decl_after_first(ident.lexeme)]
-        while is_dl(self.lookahead, ","):
-            self.advance()
-            id2 = self.match_id()
-            if id2 is None:
-                self.synchronize(); break
-            items.append(self.parse_init_decl_after_first(id2.lexeme))
-        self.match_dl(";")
-        return ast.Decl(type_spec=tps, items=items)
+                eof_type = _EOF()
+            tokens.append(Token(eof_type, "", getattr(tokens[-1], "line", 0), getattr(tokens[-1], "col", 0)))  # type: ignore
 
-    # ========== Type / Decl ==========
-    def parse_type_spec(self) -> ast.TypeSpec:
-        # BasicType | UnionSpec
-        if is_type_kw(self.lookahead):
-            word = self.lookahead.lexeme; self.advance()
-            return ast.TypeSpec(kind=word)
-        if is_union_kw(self.lookahead):
-            self.advance()
-            name = None
-            if is_id(self.lookahead):
-                name = self.lookahead.lexeme; self.advance()
-            members = None
-            if is_dl(self.lookahead, "{"):
-                members = self.parse_union_body()
-            return ast.TypeSpec(kind="union", name=name, members=members)
-        self.error("需要类型说明符")
-        # 容错返回一个 void
-        return ast.TypeSpec(kind="void")
+        self.parse_tokens(tokens)
 
-    def parse_union_body(self) -> List[ast.MemberDecl]:
-        # '{' MemberDeclList '}'
-        members: List[ast.MemberDecl] = []
-        self.match_dl("{")
-        while not is_dl(self.lookahead, "}") and self.lookahead.type != TokenType.EOF:
-            # MemberDecl → BasicType ID ArraySuffixOpt ';'
-            if not (is_type_kw(self.lookahead)):
-                self.error("联合体成员需要基本类型"); self.synchronize(sync=(";", "}")); 
-                if is_dl(self.lookahead, "}"): break
-                continue
-            tps = ast.TypeSpec(kind=self.lookahead.lexeme); self.advance()
-            name_tok = self.match_id()
-            dims = self.parse_array_suffix_opt()
-            self.match_dl(";")
-            if name_tok:
-                members.append(ast.MemberDecl(type_spec=tps, name=name_tok.lexeme, array_dims=dims))
-        self.match_dl("}")
-        return members
+    def parse_tokens(self, tokens) -> None:
+        # 映射到文法符号串
+        symbols: List[str] = []
+        positions: List[Tuple[int, int]] = []  # (line, col)
+        for tk in tokens:
+            sym = self.token_to_symbol(tk)
+            symbols.append(sym)
+            positions.append((getattr(tk, "line", None), getattr(tk, "col", None)))
 
-    def parse_array_suffix_opt(self) -> List[int]:
-        dims: List[int] = []
-        while is_dl(self.lookahead, "["):
-            self.advance()
-            if self.lookahead.type in (TokenType.NUM10, TokenType.NUM8, TokenType.NUM16):
-                dims.append(int(self.lookahead.lexeme, 0))
-                self.advance()
-            else:
-                self.error("数组维度需要整型常量")
-            self.match_dl("]")
-        return dims
+        # 初始化分析栈
+        stack: List[str] = [END_SYMBOL, self.grammar.start_symbol]
+        i = 0
 
-    def parse_init_decl_after_first(self, name: str) -> ast.InitDecl:
-        dims = self.parse_array_suffix_opt()
-        init_expr = None
-        if is_op(self.lookahead, "="):
-            self.advance()
-            init_expr = self.parse_expr()
-        return ast.InitDecl(name=name, array_dims=dims, init=init_expr)
+        # 调试：栈 + 剩余输入
+        def log(action: str):
+            if not self.debug:
+                return
+            stk = " ".join(stack[::-1])
+            rest = " ".join(symbols[i : min(i + 12, len(symbols))])
+            self.trace.append(f"{action:<20} | stack: [{stk}] | input: {rest}")
 
-    # ========== Params ==========
-    def parse_param_list_opt(self) -> List[ast.Param]:
-        if is_dl(self.lookahead, ")"):
-            return []
-        # 空参数列表：允许 void()
-        if is_kw(self.lookahead, "void"):
-            # void) 视为空参；void,x 视为普通 void 形参
-            save = self.lookahead
-            self.advance()
-            if is_dl(self.lookahead, ")"):
-                return []
-            # 回退逻辑简单：把 'void' 当成类型继续解析
-            # 这里不做真正回退，直接以 'void' 已消耗为准
-            tps = ast.TypeSpec(kind="void")
-            name_tok = self.match_id()
-            dims = self.parse_array_suffix_opt()
-            params = [ast.Param(type_spec=tps, name=name_tok.lexeme if name_tok else "_", array_dims=dims)]
-        else:
-            params = [self.parse_param()]
-        while is_dl(self.lookahead, ","):
-            self.advance()
-            params.append(self.parse_param())
-        return params
-
-    def parse_param(self) -> ast.Param:
-        tps = self.parse_type_spec()
-        name_tok = self.match_id()
-        dims = self.parse_array_suffix_opt()
-        return ast.Param(type_spec=tps, name=name_tok.lexeme if name_tok else "_", array_dims=dims)
-
-    # ========== Statements ==========
-    def parse_stmt(self) -> ast.Stmt:
-        tok = self.lookahead
-        # 局部声明
-        if is_type_kw(tok) or is_union_kw(tok):
-            decl = self.parse_decl_stmt()
-            return decl
-        # 复合语句
-        if is_dl(tok, "{"):
-            return self.parse_compound_stmt()
-        # if
-        if is_kw(tok, "if"):
-            return self.parse_if_stmt()
-        # while
-        if is_kw(tok, "while"):
-            return self.parse_while_stmt()
-        # for
-        if is_kw(tok, "for"):
-            return self.parse_for_stmt()
-        # return
-        if is_kw(tok, "return"):
-            return self.parse_return_stmt()
-        # break/continue
-        if is_kw(tok, "break"):
-            self.advance(); self.match_dl(";"); return ast.BreakStmt()
-        if is_kw(tok, "continue"):
-            self.advance(); self.match_dl(";"); return ast.ContinueStmt()
-        # 表达式/空语句
-        if is_dl(tok, ";"):
-            self.advance(); return ast.ExprStmt(expr=None)
-        expr = self.parse_expr()
-        self.match_dl(";")
-        return ast.ExprStmt(expr=expr)
-
-    def parse_decl_stmt(self) -> ast.DeclStmt:
-        tps = self.parse_type_spec()
-        # 至少一个 InitDecl
-        first_id = self.match_id()
-        items = [self.parse_init_decl_after_first(first_id.lexeme if first_id else "_")]
-        while is_dl(self.lookahead, ","):
-            self.advance()
-            id2 = self.match_id()
-            items.append(self.parse_init_decl_after_first(id2.lexeme if id2 else "_"))
-        self.match_dl(";")
-        return ast.DeclStmt(decl=ast.Decl(type_spec=tps, items=items))
-
-    def parse_compound_stmt(self) -> ast.Compound:
-        self.match_dl("{")
-        items: List[ast.Stmt] = []
-        while not is_dl(self.lookahead, "}") and self.lookahead.type != TokenType.EOF:
-            try:
-                items.append(self.parse_stmt())
-            except Exception:
-                # 兜底，避免死循环
-                self.error("解析语句失败，尝试恢复")
-                self.synchronize(sync=(";", "}"))
-        self.match_dl("}")
-        return ast.Compound(items=items)
-
-    def parse_if_stmt(self) -> ast.IfStmt:
-        self.match_kw("if")
-        self.match_dl("(")
-        cond = self.parse_expr()
-        self.match_dl(")")
-        then = self.parse_stmt()
-        els = None
-        if self.lookahead.type == TokenType.RW and self.lookahead.lexeme == "else":
-            self.advance()
-            els = self.parse_stmt()
-        return ast.IfStmt(cond=cond, then=then, els=els)
-
-    def parse_while_stmt(self) -> ast.WhileStmt:
-        self.match_kw("while")
-        self.match_dl("(")
-        cond = self.parse_expr()
-        self.match_dl(")")
-        body = self.parse_stmt()
-        return ast.WhileStmt(cond=cond, body=body)
-
-    def parse_for_stmt(self) -> ast.ForStmt:
-        self.match_kw("for")
-        self.match_dl("(")
-        init: Optional[ast.Node] = None
-        if is_type_kw(self.lookahead) or is_union_kw(self.lookahead):
-            init = self.parse_decl_stmt().decl
-        elif not is_dl(self.lookahead, ";"):
-            init = self.parse_expr()
-        self.match_dl(";")
-        cond = None if is_dl(self.lookahead, ";") else self.parse_expr()
-        self.match_dl(";")
-        step = None if is_dl(self.lookahead, ")") else self.parse_expr()
-        self.match_dl(")")
-        body = self.parse_stmt()
-        return ast.ForStmt(init=init, cond=cond, step=step, body=body)
-
-    def parse_return_stmt(self) -> ast.ReturnStmt:
-        self.match_kw("return")
-        if is_dl(self.lookahead, ";"):
-            self.advance()
-            return ast.ReturnStmt(value=None)
-        val = self.parse_expr()
-        self.match_dl(";")
-        return ast.ReturnStmt(value=val)
-
-    # ========== Expressions（按优先级多层） ==========
-    def parse_expr(self) -> ast.Expr:
-        return self.parse_assign_expr()
-
-    def parse_assign_expr(self) -> ast.Expr:
-        left = self.parse_or_expr()
-        if is_op(self.lookahead, "="):
-            # 右结合
-            self.advance()
-            right = self.parse_assign_expr()
-            return ast.Assign(target=left, value=right)
-        return left
-
-    def parse_or_expr(self) -> ast.Expr:
-        node = self.parse_and_expr()
-        while self.lookahead.type == TokenType.OP and self.lookahead.lexeme == "||":
-            op = self.lookahead.lexeme; self.advance()
-            rhs = self.parse_and_expr()
-            node = ast.Binary(op=op, left=node, right=rhs)
-        return node
-
-    def parse_and_expr(self) -> ast.Expr:
-        node = self.parse_eq_expr()
-        while self.lookahead.type == TokenType.OP and self.lookahead.lexeme == "&&":
-            op = self.lookahead.lexeme; self.advance()
-            rhs = self.parse_eq_expr()
-            node = ast.Binary(op=op, left=node, right=rhs)
-        return node
-
-    def parse_eq_expr(self) -> ast.Expr:
-        node = self.parse_rel_expr()
-        while self.lookahead.type == TokenType.OP and self.lookahead.lexeme in ("==", "!="):
-            op = self.lookahead.lexeme; self.advance()
-            rhs = self.parse_rel_expr()
-            node = ast.Binary(op=op, left=node, right=rhs)
-        return node
-
-    def parse_rel_expr(self) -> ast.Expr:
-        node = self.parse_add_expr()
-        while self.lookahead.type == TokenType.OP and self.lookahead.lexeme in ("<", ">", "<=", ">="):
-            op = self.lookahead.lexeme; self.advance()
-            rhs = self.parse_add_expr()
-            node = ast.Binary(op=op, left=node, right=rhs)
-        return node
-
-    def parse_add_expr(self) -> ast.Expr:
-        node = self.parse_mul_expr()
-        while self.lookahead.type == TokenType.OP and self.lookahead.lexeme in ("+", "-"):
-            op = self.lookahead.lexeme; self.advance()
-            rhs = self.parse_mul_expr()
-            node = ast.Binary(op=op, left=node, right=rhs)
-        return node
-
-    def parse_mul_expr(self) -> ast.Expr:
-        node = self.parse_unary_expr()
-        while self.lookahead.type == TokenType.OP and self.lookahead.lexeme in ("*", "/", "%"):
-            op = self.lookahead.lexeme; self.advance()
-            rhs = self.parse_unary_expr()
-            node = ast.Binary(op=op, left=node, right=rhs)
-        return node
-
-    def parse_unary_expr(self) -> ast.Expr:
-        if self.lookahead.type == TokenType.OP and self.lookahead.lexeme in ("+", "-", "!"):
-            op = self.lookahead.lexeme; self.advance()
-            expr = self.parse_unary_expr()
-            return ast.Unary(op=op, expr=expr)
-        return self.parse_postfix_expr()
-
-    def parse_postfix_expr(self) -> ast.Expr:
-        node = self.parse_primary()
+        log("INIT")
         while True:
-            # 函数调用
-            if is_dl(self.lookahead, "("):
-                self.advance()
-                args = self.parse_arg_list_opt()
-                self.match_dl(")")
-                node = ast.Call(func=node, args=args)
-                continue
-            # 下标
-            if is_dl(self.lookahead, "["):
-                self.advance()
-                idx = self.parse_expr()
-                self.match_dl("]")
-                node = ast.Index(seq=node, index=idx)
-                continue
-            # 成员访问
-            if self.lookahead.type == TokenType.OP and self.lookahead.lexeme == ".":
-                self.advance()
-                name_tok = self.match_id()
-                node = ast.Member(obj=node, name=name_tok.lexeme if name_tok else "_")
-                continue
-            # 后缀 ++/--
-            if self.lookahead.type == TokenType.OP and self.lookahead.lexeme in ("++", "--"):
-                op = self.lookahead.lexeme; self.advance()
-                node = ast.Unary(op=f"post{op}", expr=node)
-                continue
-            break
-        return node
+            if not stack:
+                # 栈空而输入未结束
+                line, col = positions[max(0, i - 1)]
+                raise ParseError("分析栈提前耗尽，输入尚未结束", line, col)
 
-    def parse_primary(self) -> ast.Expr:
-        # ID / printf / 常量 / '(' Expr ')'
-        if is_id(self.lookahead):
-            name = self.lookahead.lexeme; self.advance()
-            return ast.Identifier(name=name)
-        # printf 被当成 RW 也能解析（按 Primary 处理）
-        if self.lookahead.type == TokenType.RW and self.lookahead.lexeme == "printf":
-            name = self.lookahead.lexeme; self.advance()
-            return ast.Identifier(name=name)
-        if is_const(self.lookahead):
-            tok = self.lookahead; self.advance()
-            kind = ("INT" if tok.type in (TokenType.NUM10, TokenType.NUM8, TokenType.NUM16)
-                    else "FLOAT" if tok.type == TokenType.FLOAT
-                    else "CHAR" if tok.type == TokenType.CS_CHAR
-                    else "STRING")
-            return ast.Constant(kind=kind, value=tok.lexeme)
-        if is_dl(self.lookahead, "("):
-            self.advance()
-            e = self.parse_expr()
-            self.match_dl(")")
-            return e
-        self.error(f"需要主表达式，实际是 `{self.lookahead.lexeme}`")
-        # 返回一个占位标识符，避免后续崩溃
-        bogus = ast.Identifier(name="_")
-        self.advance()
-        return bogus
+            X = stack.pop()
+            a = symbols[i] if i < len(symbols) else END_SYMBOL
 
-    def parse_arg_list_opt(self) -> List[ast.Expr]:
-        if is_dl(self.lookahead, ")"):
-            return []
-        args = [self.parse_expr()]
-        while is_dl(self.lookahead, ","):
-            self.advance()
-            args.append(self.parse_expr())
-        return args
+            if X == END_SYMBOL and a == END_SYMBOL:
+                log("ACCEPT")
+                return  # 接受
+
+            if self.grammar.is_terminal(X) or X == END_SYMBOL:
+                # 终结符：必须匹配
+                if X == a:
+                    log(f"match '{a}'")
+                    i += 1
+                    continue
+                else:
+                    line, col = positions[i]
+                    raise ParseError(f"期望终结符 {X}，但看到 {a}", line, col)
+
+            # 非终结符：查预测分析表
+            prod = self.table.get(X, a)
+            if prod is None:
+                # 给出一点候选提示
+                row = self.table.table.get(X, {})
+                candidates = ", ".join(sorted(row.keys()))
+                line, col = positions[i]
+                raise ParseError(
+                    f"在非终结符 {X} 处，对当前输入 {a} 无可用产生式（期望的是: {candidates}）", line, col
+                )
+
+            # 应用产生式：X → Y1 Y2 ... Yk
+            rhs = list(prod.body)
+            if len(rhs) == 1 and rhs[0] == EPSILON:
+                log(f"reduce {prod}  (ε)")
+                # ε 产生式：什么也不压
+            else:
+                # 逆序压栈
+                for s in reversed(rhs):
+                    stack.append(s)
+                log(f"reduce {prod}")

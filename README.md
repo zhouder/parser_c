@@ -1,23 +1,55 @@
-﻿# C 子集语法分析器（递归下降/LL(1)）
+﻿# parser_c
 
-## 功能
-- 词法：识别关键字、标识符、10/8/16 进制整数、浮点、字符串/字符常量、运算符、界符，支持 // 和 /* */ 注释，非法数字后缀报错。
-- 语法：递归下降（等价 LL(1)）；支持类型/变量声明、union、函数定义、块、if/while/for/return/break/continue、表达式优先级、函数调用/数组/成员访问/自增自减。
-- 预处理：简单处理 `#include <...>`。
-- 错误恢复：在 `;`/`}` 上同步，输出行列信息。
+基于 **LL(1)** 的 C 子集语法分析程序。  
+复用你现有的 **lexer_c**（`service/token.py`, `service/matcher.py`, `service/lexer.py`），在其之上完成：
 
-## 目录
-- `main_parser.py`：入口，读取源文件，调用词法/语法，打印错误或 AST 概览。
-- `service/lexer.py`、`matcher.py`、`token.py`：词法分析与记号定义。
-- `service/parser.py`：语法分析。
-- `service/ast.py`：AST 节点定义。
-- `test.c`：示例 C 程序。
+- FIRST / FOLLOW / SELECT 集合计算  
+- LL(1) 预测分析表构造  
+- 语法分析（分析栈 + 输入指针）  
+- 友好报错（行/列/遇到的记号/期望候选）
 
-## 运行
-```bash
-python main_parser.py test.c
+> 说明：文件名按你的要求使用 `grammer.py`（不是 grammar）。
+
+---
+
+## 环境要求
+
+- Python **3.9+**（推荐 3.10+）
+- 复制你自己的 `lexer_c` 三个文件到 `service/` 目录：
+  - `service/token.py`
+  - `service/matcher.py`
+  - `service/lexer.py`
+
+---
+
+## 目录结构
 ```
+parser_c/
+    README.md
+    main.py
+    test.c
+    service/
+        grammer.py # 文法&产生式（build_grammar）
+        first_follow.py # FIRST / FOLLOW / SELECT
+        parse_table.py # LL(1) 预测分析表
+        parser.py # 预测分析器（调用 lexer_c）
+        lexer.py 
+        matcher.py 
+        token.py 
+```
+---
 
-## 输出
-- 通过时：打印 “语法分析通过，AST 概览：” 以及 AST 摘要。
-- 出错时：打印错误数和列表，如 `[行:列] 错误信息`。
+## 快速开始
+**运行**  
+```bash
+python main.py test.c
+```
+`--show-ff`：打印 FIRST/FOLLOW/SELECT 部分结果与表格规模
+`--trace`：打印分析过程（栈/剩余输入/用到的产生式），便于调试或写实验报告
+`--export-xlsx [file]`：导出 LL(1) 预测分析表为 xlsx，默认文件名 `parse_table.xlsx`
+
+示例：解析并导出表格  
+```bash
+python main.py test.c --export-xlsx  # 生成 parse_table.xlsx
+python main.py test.c --export-xlsx my_table.xlsx  # 自定义文件名
+```
