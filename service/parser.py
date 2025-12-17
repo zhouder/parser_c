@@ -29,6 +29,15 @@ class ParseTreeNode:
         self.children.append(node)
 
 
+@dataclass
+class TraceEntry:
+    step: int
+    stack: str
+    input: str
+    production: str
+    action: str
+
+
 class Parser:
     def __init__(self, grammar: Grammar, table: ParseTable, debug: bool = False):
         self.grammar = grammar
@@ -37,6 +46,7 @@ class Parser:
         self.trace: List[str] = []
         self.used_productions: List[Production] = []
         self.used_table_entries: List[Tuple[str, str, Production]] = []
+        self.trace_entries: List[TraceEntry] = []
         # 收集 struct/union 的标签名，使其可以当作 TYPE_NAME 使用（用于兼容 `student a;` 这种写法）
         self.type_names: Set[str] = set()
 
@@ -117,7 +127,13 @@ class Parser:
                 out.append(self._lookahead_symbol(tokens, j))
             return " ".join(out)
 
+        def snapshot_stack() -> str:
+            # Stack top on the left.
+            return " ".join(stack[::-1])
+
+        self.trace_entries.clear()
         trace_step = 0
+        table_step = 0
 
         def log(action: str) -> None:
             if not self.debug:
@@ -127,24 +143,43 @@ class Parser:
             stk = " ".join(stack[::-1])
             self.trace.append(f"{trace_step:05d} {action:<20} | stack: [{stk}] | input: {preview_input()}")
 
+        def log_table(step_no: int, production: str, action: str) -> None:
+            self.trace_entries.append(
+                TraceEntry(
+                    step=step_no,
+                    stack=snapshot_stack(),
+                    input=preview_input(),
+                    production=production,
+                    action=action,
+                )
+            )
+
         log("INIT")
+        log_table(step_no=0, production="", action="INIT")
         while True:
             if not stack:
                 last_tok = tokens[max(0, i - 1)] if tokens else Token(TokenType.EOF, "", 1, 1)
                 raise ParseError("分析栈提前耗尽，输入尚未结束", getattr(last_tok, "line", None), getattr(last_tok, "col", None))
 
-            X = stack.pop()
+            # Snapshot before taking action (textbook-style table row)
+            table_step += 1
+            log_table(step_no=table_step, production="", action="")
+            X = stack[-1]
+            a = self._lookahead_symbol(tokens, i)
+
+            stack.pop()
             parent_node = parent_stack.pop()
             role = role_stack.pop()
-            a = self._lookahead_symbol(tokens, i)
 
             if X == END_SYMBOL and a == END_SYMBOL:
                 log("ACCEPT")
+                self.trace_entries[-1].action = "ACCEPT"
                 return root if return_tree else None
 
             if self.grammar.is_terminal(X) or X == END_SYMBOL:
                 if X == a:
                     log(f"match '{a}'")
+                    self.trace_entries[-1].action = f"匹配终结符 {a}"
                     tok = tokens[i]
                     if role == "tag_name" and getattr(tok, "lexeme", ""):
                         self.type_names.add(tok.lexeme)
@@ -186,6 +221,8 @@ class Parser:
             rhs = list(prod.body)
             if len(rhs) == 1 and rhs[0] == EPSILON:
                 log(f"reduce {prod}  (ε)")
+                self.trace_entries[-1].production = str(prod)
+                self.trace_entries[-1].action = f"{X} 弹栈（ε）"
                 if return_tree and current_node is not None:
                     current_node.add_child(ParseTreeNode(EPSILON))
                 continue
@@ -204,3 +241,5 @@ class Parser:
                 parent_stack.append(current_node if return_tree else None)
                 role_stack.append(sym_role)
             log(f"reduce {prod}")
+            self.trace_entries[-1].production = str(prod)
+            self.trace_entries[-1].action = f"{X} 弹栈，产生式右部逆序压栈"

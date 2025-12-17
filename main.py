@@ -14,6 +14,7 @@ from service.first_follow import (
 from service.parse_table import ParseTable
 from service.ast_builder import ASTNode, build_ast
 from service.parser import Parser, ParseError, ParseTreeNode
+from service.xlsx_util import export_grid_xlsx
 
 
 def _tree_label(node: ParseTreeNode) -> str:
@@ -41,6 +42,27 @@ def render_ast_lines(node: ASTNode, prefix: str = "", is_last: bool = True) -> L
     for idx, child in enumerate(node.children):
         lines.extend(render_ast_lines(child, prefix=child_prefix, is_last=(idx == len(node.children) - 1)))
     return lines
+
+
+def render_trace_table(entries, limit: int) -> str:
+    # Basic fixed-width table, similar to textbook LL(1) analysis tables.
+    rows = entries if limit == 0 else entries[:limit]
+    headers = ["步骤", "分析栈", "符号串", "产生式", "下一步动作"]
+    data = []
+    for e in rows:
+        data.append([str(e.step), e.stack, e.input, e.production, e.action])
+
+    widths = [len(h) for h in headers]
+    for row in data:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+
+    def fmt_row(row):
+        return " | ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row))
+
+    out_lines = [fmt_row(headers), "-+-".join("-" * w for w in widths)]
+    out_lines.extend(fmt_row(r) for r in data)
+    return "\n".join(out_lines)
 
 
 def render_ll1_table_lines(table: ParseTable, grammar, nonterminal: str | None, limit: int) -> List[str]:
@@ -90,6 +112,11 @@ def main():
         action="store_true",
         help="Show FIRST/FOLLOW/SELECT only for nonterminals/productions used while parsing the source file.",
     )
+    ap.add_argument(
+        "--ff-lookahead-only",
+        action="store_true",
+        help="When used with --show-ff-used: filter set elements to only terminals actually seen as lookahead during parsing (plus EOF/epsilon).",
+    )
     ap.add_argument("--show-select-all", action="store_true", help="Show SELECT sets for all productions (can be long)")
     ap.add_argument("--show-table", action="store_true", help="Print LL(1) parse table (can be very long)")
     ap.add_argument(
@@ -110,6 +137,24 @@ def main():
         type=int,
         default=200,
         help="How many trace lines to print (0 = all, default: 200). Requires --trace.",
+    )
+    ap.add_argument(
+        "--trace-table",
+        action="store_true",
+        help="Print LL(1) analysis as a step-by-step table (stack/input/production/action).",
+    )
+    ap.add_argument(
+        "--trace-table-limit",
+        type=int,
+        default=200,
+        help="How many trace-table rows to print (0 = all, default: 200). Requires --trace-table.",
+    )
+    ap.add_argument(
+        "--export-trace-xlsx",
+        nargs="?",
+        const="trace_table.xlsx",
+        default=None,
+        help="Export the LL(1) trace table to an .xlsx file (default: trace_table.xlsx).",
     )
     ap.add_argument("--show-tree", action="store_true", help="Print parse tree (syntax tree)")
     ap.add_argument("--show-ast", action="store_true", help="Print a simplified AST (abstract syntax tree)")
@@ -214,6 +259,15 @@ def main():
                 nonterminal_order=sorted(used_nts),
             )
             print(f"[Export] Used LL(1) table entries saved to: {out_path}")
+
+        if args.export_trace_xlsx:
+            out_path = Path(args.export_trace_xlsx)
+            rows = parser.trace_entries if args.trace_table_limit == 0 else parser.trace_entries[: args.trace_table_limit]
+            grid = [["步骤", "分析栈", "符号串", "产生式", "下一步动作"]]
+            for e in rows:
+                grid.append([str(e.step), e.stack, e.input, e.production, e.action])
+            export_grid_xlsx(out_path, grid, sheet_name="TraceTable")
+            print(f"[Export] LL(1) trace table saved to: {out_path}")
         if args.show_table_used:
             print("\n=== LL(1) Parse Table (used entries) ===")
             seen_cells = set()
@@ -231,13 +285,22 @@ def main():
                     break
         if args.show_ff_used:
             used_nts = _used_nonterminals_from_productions(grammar, parser.used_productions)
+            lookahead_terms = {term for (_, term, _) in parser.used_table_entries}
+            lookahead_terms.add(END_SYMBOL)
+            lookahead_terms.add(EPSILON)
+
+            def maybe_filter(items: set[str]) -> List[str]:
+                if args.ff_lookahead_only:
+                    items = set(items) & lookahead_terms
+                return sorted(items, key=lambda s: (s != EPSILON and s != END_SYMBOL, s))
+
             print("\n=== FIRST Sets (used) ===")
             for nt in used_nts:
-                items = ", ".join(sorted(first_sets[nt], key=lambda s: (s != EPSILON, s)))
+                items = ", ".join(maybe_filter(first_sets[nt]))
                 print(f"FIRST({nt}) = {{ {items} }}")
             print("\n=== FOLLOW Sets (used) ===")
             for nt in used_nts:
-                items = ", ".join(sorted(follow_sets[nt], key=lambda s: (s != END_SYMBOL, s)))
+                items = ", ".join(maybe_filter(follow_sets[nt]))
                 print(f"FOLLOW({nt}) = {{ {items} }}")
             print("\n=== SELECT Sets (used productions) ===")
             seen = set()
@@ -246,12 +309,16 @@ def main():
                     continue
                 seen.add(prod)
                 sel = select_sets.get(prod, set())
-                print(f"SELECT({prod}) = {{ {', '.join(sorted(sel))} }}")
+                items = ", ".join(maybe_filter(sel))
+                print(f"SELECT({prod}) = {{ {items} }}")
         if args.trace:
             print("\n=== Trace ===")
             lines = parser.trace if args.trace_limit == 0 else parser.trace[-args.trace_limit :]
             for line in lines:
                 print(line)
+        if args.trace_table:
+            print("\n=== Trace Table ===")
+            print(render_trace_table(parser.trace_entries, limit=args.trace_table_limit))
         if args.show_tree and tree is not None:
             print("\n=== Parse Tree ===")
             print("\n".join(render_tree_lines(tree)))
